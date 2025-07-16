@@ -1,0 +1,330 @@
+# dynamic_weighted_scoring.py
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.arima.model import ARIMA
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+import time
+import os
+import requests
+from io import BytesIO
+from zipfile import ZipFile
+
+# ========================
+# 全局配置参数 (完全透明)
+# ========================
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+
+# 动态加权参数
+WINDOW_SIZE = 100       # 历史窗口长度
+QUANTILE_THRESH = 0.75  # 动态分位数阈值
+EPSILON = 1e-7          # 零值阈值
+
+# ARIMA合成数据参数
+ARIMA_ORDER = (2, 1, 1)  # (p,d,q)
+DATA_LENGTH = 10000     # 时间步长
+CHANGE_INTERVAL = 500   # 结构变化间隔
+MISSING_RATE = 0.05     # 缺失值比例
+NOISE_VAR = 0.1         # 噪声方差
+
+# 实验参数
+N_FOLDS = 10            # 交叉验证折数
+
+# ========================
+# 数据生成与加载
+# ========================
+
+def generate_synthetic_data():
+    """生成基于ARIMA模型的合成时序数据"""
+    print("生成合成时序数据...")
+    # 初始化序列
+    sequence = np.zeros(DATA_LENGTH)
+    sequence[0] = np.random.normal(0, 1)
+    
+    # ARIMA模型参数
+    ar_params = [0.6, -0.2]  # AR(2)系数
+    ma_params = [0.3]        # MA(1)系数
+    
+    # 生成基础序列
+    for t in range(1, DATA_LENGTH):
+        # AR部分
+        ar_term = 0
+        if t >= 1:
+            ar_term += ar_params[0] * sequence[t-1]
+        if t >= 2:
+            ar_term += ar_params[1] * sequence[t-2]
+        
+        # MA部分
+        ma_term = 0
+        if t >= 1:
+            ma_term += ma_params[0] * np.random.normal(0, NOISE_VAR)
+        
+        sequence[t] = ar_term + ma_term + np.random.normal(0, NOISE_VAR)
+    
+    # 注入周期性结构变化
+    for i in range(0, DATA_LENGTH, CHANGE_INTERVAL):
+        if i + CHANGE_INTERVAL < DATA_LENGTH:
+            # 均值跳跃
+            jump = np.random.choice([-1, 1]) * np.std(sequence[:i]) * 1.5
+            sequence[i:i+CHANGE_INTERVAL] += jump
+            
+            # 方差突变
+            var_scale = np.random.uniform(0.5, 2.0)
+            sequence[i:i+CHANGE_INTERVAL] *= var_scale
+    
+    # 添加缺失值
+    missing_mask = np.random.rand(DATA_LENGTH) < MISSING_RATE
+    sequence[missing_mask] = np.nan
+    
+    # 线性插值
+    df = pd.Series(sequence)
+    sequence = df.interpolate(method='linear').values
+    
+    return sequence
+
+def load_sp500_data():
+    """加载标普500历史数据 (金融时序数据集)"""
+    print("下载标普500数据")
+    # 使用https://www.marketwatch.com/investing/index/spx/download-data获取数据
+    sp500 = yf.download('^GSPC', start='2014-01-01', end='2024-01-01')
+    
+    # 预处理
+    sp500 = sp500[['Close']].reset_index()
+    sp500.columns = ['Date', 'Price']
+    
+    # 创建特征
+    sp500['Return'] = sp500['Price'].pct_change()
+    sp500['Volatility'] = sp500['Return'].rolling(5).std()
+    
+    # 处理缺失值
+    sp500 = sp500.dropna()
+    
+    # 标准化
+    scaler = MinMaxScaler()
+    sp500[['Price', 'Return', 'Volatility']] = scaler.fit_transform(
+        sp500[['Price', 'Return', 'Volatility']]
+    )
+    
+    return sp500[['Return', 'Volatility']].values
+
+def load_creditcard_data():
+    """加载信用卡欺诈数据集 (分类数据集)"""
+    print("下载信用卡欺诈数据...")
+    # 数据集URL (Kaggle源)
+    URL = "https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud"
+    
+    # 由于Kaggle需要认证，这里提供备用下载方式
+    # 实际使用时应使用Kaggle API (需要kaggle.json)
+    try:
+        # 尝试从Kaggle下载
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        api = KaggleApi()
+        api.authenticate()
+        api.dataset_download_files('mlg-ulb/creditcardfraud', path='./data', unzip=True)
+        df = pd.read_csv('./data/creditcard.csv')
+    except:
+        # 备用下载方式 (使用预上传的副本)
+        print("使用备用数据源...")
+        backup_url = "https://storage.googleapis.com/kaggle-data-sets/310/2879/bundle/archive.zip?X-Goog-Algorithm=GOOG4-RSA-SHA256"
+        response = requests.get(backup_url)
+        with ZipFile(BytesIO(response.content)) as zipfile:
+            with zipfile.open('creditcard.csv') as file:
+                df = pd.read_csv(file)
+    
+    # 预处理
+    scaler = StandardScaler()
+    df[['Time', 'Amount']] = scaler.fit_transform(df[['Time', 'Amount']])
+    
+    # 分离特征和标签
+    X = df.drop('Class', axis=1).values
+    y = df['Class'].values
+    
+    return X, y
+
+# ========================
+# 基线方法实现
+# ========================
+
+def fixed_weighting(sequence):
+    """固定权重方法 [1]"""
+    weights = [0.4, 0.6]  # 固定权重比例
+    result = np.zeros(len(sequence))
+    for i in range(2, len(sequence)):
+        result[i] = weights[0] * sequence[i-1] + weights[1] * sequence[i-2]
+    return result
+
+def adf_threshold(sequence, window=50):
+    """ADF阈值方法 [2]"""
+    result = np.zeros(len(sequence))
+    for i in range(window, len(sequence)):
+        adf_result = adfuller(sequence[i-window:i])
+        p_value = adf_result[1]
+        # 固定阈值判断
+        if p_value < 0.05:
+            result[i] = 1
+    return result
+
+def dwa_method(sequence):
+    """动态加权平均方法 [5]"""
+    result = np.zeros(len(sequence))
+    for i in range(1, len(sequence)):
+        # 简单动态加权
+        weight = min(0.9, max(0.1, i / len(sequence)))
+        result[i] = weight * sequence[i] + (1 - weight) * result[i-1]
+    return result
+
+# ========================
+# 专利核心算法
+# ========================
+
+class DynamicWeightScoring:
+    """动态加权特征评分方法"""
+    def __init__(self, window_size=WINDOW_SIZE):
+        self.window_size = window_size
+        self.history = []  # 存储历史统计量
+    
+    def calculate_weights(self, sequence, t):
+        """计算动态权重"""
+        if t < 3:  # 需要至少3个点
+            return 0.5, 0.5
+        
+        # 执行ADF检验
+        adf_stat, p_value, _, _, _, _ = adfuller(sequence[t-3:t])
+        
+        # 三点中位数平滑
+        smooth_stat = np.median(sequence[t-3:t])
+        self.history.append(smooth_stat)
+        
+        # 确保有足够历史数据
+        if len(self.history) > self.window_size:
+            # 使用历史数据计算分位数阈值 (排除当前点)
+            window_data = self.history[-self.window_size:-1]
+            tau_t = np.quantile(window_data, QUANTILE_THRESH)
+            
+            # 复合条件判断
+            if (smooth_stat > tau_t) and (p_value < 0.05):
+                alpha_t = abs(smooth_stat) / max(abs(smooth_stat), EPSILON)
+                beta_t = 1.0 - alpha_t
+            else:
+                alpha_t = 0.0
+                beta_t = 1.0
+            return alpha_t, beta_t
+        
+        return 0.5, 0.5
+    
+    def predict(self, sequence):
+        """应用动态加权评分"""
+        result = np.zeros(len(sequence))
+        for t in range(3, len(sequence)):
+            alpha, beta = self.calculate_weights(sequence, t)
+            # 加权计算 (简化示例)
+            result[t] = alpha * sequence[t] + beta * sequence[t-1]
+        return result
+
+# ========================
+# 实验评估框架
+# ========================
+
+def evaluate_performance(y_true, y_pred):
+    """评估模型性能"""
+    # 计算AUC
+    auc = roc_auc_score(y_true, y_pred)
+    
+    # 计算误判率 (假阳性率)
+    fpr = np.sum((y_pred > 0.5) & (y_true == 0)) / np.sum(y_true == 0)
+    
+    return auc, fpr
+
+def run_experiment(data, labels=None):
+    """运行完整实验"""
+    results = []
+    
+    # 专利方法
+    start_time = time.time()
+    model = DynamicWeightScoring()
+    patent_pred = model.predict(data)
+    patent_time = time.time() - start_time
+    patent_auc, patent_fpr = evaluate_performance(labels, patent_pred) if labels is not None else (0, 0)
+    
+    # 基线方法
+    methods = {
+        "固定权重法": fixed_weighting,
+        "ADF阈值法": lambda x: adf_threshold(x, window=50),
+        "DWA方法": dwa_method
+    }
+    
+    for name, method in methods.items():
+        start_time = time.time()
+        pred = method(data)
+        runtime = time.time() - start_time
+        auc, fpr = evaluate_performance(labels, pred) if labels is not None else (0, 0)
+        
+        results.append({
+            "方法": name,
+            "AUC": auc,
+            "误判率": fpr,
+            "计算耗时(s)": runtime
+        })
+    
+    # 添加专利结果
+    results.append({
+        "方法": "本发明",
+        "AUC": patent_auc,
+        "误判率": patent_fpr,
+        "计算耗时(s)": patent_time
+    })
+    
+    return pd.DataFrame(results)
+
+# ========================
+# 主执行函数
+# ========================
+
+if __name__ == "__main__":
+    # 创建结果目录
+    os.makedirs("results", exist_ok=True)
+    
+    print("="*50)
+    print("动态加权特征评分方法 - 专利实现")
+    print("="*50)
+    
+    # 实验1: 合成数据
+    print("\n实验1: 合成时序数据")
+    synthetic_data = generate_synthetic_data()
+    synthetic_labels = np.where(synthetic_data > np.quantile(synthetic_data, 0.95), 1, 0)
+    synthetic_results = run_experiment(synthetic_data, synthetic_labels)
+    print(synthetic_results)
+    synthetic_results.to_csv("results/synthetic_results.csv", index=False)
+    
+    # 实验2: 标普500数据
+    print("\n实验2: 标普500金融数据")
+    sp500_data = load_sp500_data()
+    # 创建标签: 当波动率超过95%分位数时标记为异常
+    volatility = sp500_data[:, 1]
+    sp500_labels = np.where(volatility > np.quantile(volatility, 0.95), 1, 0)
+    sp500_results = run_experiment(sp500_data[:, 0], sp500_labels)
+    print(sp500_results)
+    sp500_results.to_csv("results/sp500_results.csv", index=False)
+    
+    # 实验3: 信用卡欺诈数据
+    print("\n实验3: 信用卡欺诈检测")
+    X, y = load_creditcard_data()
+    # 简化: 使用第一个特征作为示例
+    credit_results = run_experiment(X[:, 0], y)
+    print(credit_results)
+    credit_results.to_csv("results/credit_results.csv", index=False)
+    
+    # 汇总结果
+    summary = pd.concat([
+        synthetic_results.assign(数据集="合成数据"),
+        sp500_results.assign(数据集="标普500"),
+        credit_results.assign(数据集="信用卡欺诈")
+    ])
+    summary.to_csv("results/summary_results.csv", index=False)
+    
+    print("\n实验完成! 结果保存在 results/ 目录")
+    print("="*50)
