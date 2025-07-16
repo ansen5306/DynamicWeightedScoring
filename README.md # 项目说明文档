@@ -1,0 +1,24 @@
+# Dynamic Weighted Scoring - 动态加权特征评分方法# Dynamic Weighted Scoring - 动态加权特征评分方法
+
+[![License: MIT](https://opensource.org/licenses/MIT)[![License: MIT](https://opensource.org/licenses/MIT)
+[![Python 3.9]https://www.python.org/downloads/](https://www.python.org/downloads/release/python-390/)[![Python 3.9]https://www.python.org/downloads/](https://www.python.org/downloads/release/python-390/)
+
+**官方实现**：中国发明专利"动态加权特征评分方法"（申请号：202510804192X）**官方实现**：中国发明专利"动态加权特征评分方法"（申请号：202510804192X）
+
+## 📖 技术概述## 📖 技术概述
+
+本仓库实现了基于ADF统计量的动态特征加权方法，解决了时序数据分析中的三大关键问题：本仓库实现了基于ADF统计量的动态特征加权方法，解决了时序数据分析中的三大关键问题：
+1. **噪声敏感问题** - 通过三点中位数平滑优化ADF检验1. **噪声敏感问题** - 通过三点中位数平滑优化ADF检验
+2. **硬切换缺陷** - 采用QACF+HSIC复合加权策略2. **硬切换缺陷** - 采用QACF+HSIC复合加权策略
+3. **阈值僵化** - 创新动态分位数阈值机制3. **阈值僵化** - 创新动态分位数阈值机制
+
+## 🚀 快速开始## 🚀 快速开始
+
+# 克隆仓库# 克隆仓库
+https://github.com/ansen5306/DynamicWeightedScoringhttps://github.com/ansen5306/DynamicWeightedScoring
+
+# 安装依赖# 安装依赖
+pip install -r requirements.txtpip install -r requirements.txt
+
+# 运行完整实验（生成数据+训练+评估）# 运行完整实验（生成数据+训练+评估）
+python main.pypython main.py
